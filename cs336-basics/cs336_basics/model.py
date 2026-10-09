@@ -396,7 +396,9 @@ class SwiGLU(nn.Module):
         self.w3 = Linear(d_model, d_ff)
 
     def forward(self, x):
-        return self.w2(silu(self.w1(x)) * self.w3(x))
+        with torch.cuda.nvtx.range("FFN"):
+            output = self.w2(silu(self.w1(x)) * self.w3(x))
+        return output
 
 
 def scaled_dot_product_attention(
@@ -424,15 +426,19 @@ def scaled_dot_product_attention(
     """
 
     d_k = K.shape[-1]
-    attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
+    
+    with torch.cuda.nvtx.range("attention_scores"):
+        attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
 
     if mask is not None:
         attention_scores = torch.where(mask, attention_scores, float("-inf"))
 
-    attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
+    with torch.cuda.nvtx.range("attention_softmax"):
+        attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
 
-    return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
-
+    with torch.cuda.nvtx.range("attention @ V"):
+        output = einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+    return output
 
 class CausalMultiHeadSelfAttention(nn.Module):
     """Multi-Head Self-Attention
@@ -488,43 +494,45 @@ class CausalMultiHeadSelfAttention(nn.Module):
         Returns:
             Self-attention outputs.
         """
-        *batch_dims, sequence_length, d_model = x.size()
-        assert d_model == self.d_model
+        with torch.cuda.nvtx.range("attention"):
+            *batch_dims, sequence_length, d_model = x.size()
+            assert d_model == self.d_model
+            
+            Q = self.q_proj(x)
+            K = self.k_proj(x)
+            V = self.v_proj(x)
 
-        Q = self.q_proj(x)
-        K = self.k_proj(x)
-        V = self.v_proj(x)
+            # Take apart each head from the embedding dimension of Q, K, V to shape (..., num_heads, seq_len, d_k).
+            Q, K, V = (
+                rearrange(X, "... seq (heads d) -> ... heads seq d", heads=self.num_heads)
+                for X in (Q, K, V)
+            )  # fmt: skip
 
-        # Take apart each head from the embedding dimension of Q, K, V to shape (..., num_heads, seq_len, d_k).
-        Q, K, V = (
-            rearrange(X, "... seq (heads d) -> ... heads seq d", heads=self.num_heads)
-            for X in (Q, K, V)
-        )  # fmt: skip
+            if self.positional_encoder is not None:  # RoPE is enabled
+                if token_positions is not None:  # We got explicit position ids
+                    # Duplicate token positions for each head
+                    token_positions = rearrange(token_positions, "... seq -> ... 1 seq")
 
-        if self.positional_encoder is not None:  # RoPE is enabled
-            if token_positions is not None:  # We got explicit position ids
-                # Duplicate token positions for each head
-                token_positions = rearrange(token_positions, "... seq -> ... 1 seq")
+                Q = self.positional_encoder(Q, token_positions)
+                K = self.positional_encoder(K, token_positions)
 
-            Q = self.positional_encoder(Q, token_positions)
-            K = self.positional_encoder(K, token_positions)
+            # Construct causal mask
+            iota = torch.arange(sequence_length, device=x.device)
+            qi = rearrange(iota, "query -> query 1")
+            kj = rearrange(iota, "key   -> 1   key")
+            causal_mask = qi >= kj  # (query, key)
+            causal_mask = causal_mask.__getitem__((None,) * len(batch_dims) + (...,))  # Add appropriate leading dimensions
 
-        # Construct causal mask
-        iota = torch.arange(sequence_length, device=x.device)
-        qi = rearrange(iota, "query -> query 1")
-        kj = rearrange(iota, "key   -> 1   key")
-        causal_mask = qi >= kj  # (query, key)
-        causal_mask = causal_mask.__getitem__((None,) * len(batch_dims) + (...,))  # Add appropriate leading dimensions
+            # Shape: (..., num_heads, sequence_length, d_k)
+            attn_output = scaled_dot_product_attention(K=K, Q=Q, V=V, mask=causal_mask)
 
-        # Shape: (..., num_heads, sequence_length, d_k)
-        attn_output = scaled_dot_product_attention(K=K, Q=Q, V=V, mask=causal_mask)
+            # Concatenate the attention output from all heads.
+            # (..., sequence_length, num_heads * d_v).
+            attn_output = rearrange(attn_output, "batch heads seq d_v -> batch seq (heads d_v)").contiguous()
 
-        # Concatenate the attention output from all heads.
-        # (..., sequence_length, num_heads * d_v).
-        attn_output = rearrange(attn_output, "batch heads seq d_v -> batch seq (heads d_v)").contiguous()
-
-        # Apply the output projection
-        output = self.output_proj(attn_output)
+            # Apply the output projection
+            with torch.cuda.nvtx.range("attention_output_projection"):
+                output = self.output_proj(attn_output)
         return output
 
 
