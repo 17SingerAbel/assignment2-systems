@@ -43,18 +43,27 @@ def clear_gpu_cache():
     torch.cuda.empty_cache()
 
 
-def run_step(lm, optimizer, train_data, labels, mode):
+def run_step(lm, optimizer, train_data, labels, mode, amp_dtype):
+
+    device = next(lm.parameters()).device
+    # print('run step device', device.type)
+
     if mode != FORWARD:
         optimizer.zero_grad()
 
     with torch.cuda.nvtx.range("forward"):
-        if mode == FORWARD:
-            with torch.no_grad():
+        
+        with torch.autocast(device_type=device.type, 
+                            dtype=amp_dtype or torch.bfloat16,
+                            enabled=amp_dtype is not None
+        ):
+            if mode == FORWARD:
+                with torch.no_grad():
+                    logits = lm(train_data)
+                    loss = cross_entropy(logits, labels)
+            else:
                 logits = lm(train_data)
                 loss = cross_entropy(logits, labels)
-        else:
-            logits = lm(train_data)
-            loss = cross_entropy(logits, labels)
 
     if mode != FORWARD:
         with torch.cuda.nvtx.range("backward"):
@@ -65,7 +74,7 @@ def run_step(lm, optimizer, train_data, labels, mode):
             optimizer.step()
 
 
-def benchmark_model(dataset, config: BenchmarkConfig,  mode, device, warmup_flag=True, dtype=torch.float32):
+def benchmark_model(dataset, config: BenchmarkConfig,  mode, device, warmup_flag=True, param_dtype=torch.float32, amp_dtype=None):
     lm = BasicsTransformerLM(config.vocab_size, config.context_length, config.d_model, config.num_layers, config.num_heads, config.d_ff, rope_theta=None)
     param_bytes = sum(
         p.numel() * p.element_size()
@@ -74,7 +83,7 @@ def benchmark_model(dataset, config: BenchmarkConfig,  mode, device, warmup_flag
 
     print(f"Parameters: {param_bytes / 1024**3:.2f} GiB")
 
-    lm = lm.to(device, dtype=dtype)
+    lm = lm.to(device, dtype=param_dtype)
     optimizer = AdamW(lm.parameters())
 
     train_data, labels = get_batch(dataset, config.batch_size, config.context_length, device)
@@ -82,7 +91,7 @@ def benchmark_model(dataset, config: BenchmarkConfig,  mode, device, warmup_flag
     # warmup
     if warmup_flag:
         for _ in range(config.warmup_iterations):
-                run_step(lm, optimizer, train_data, labels, mode)
+                run_step(lm, optimizer, train_data, labels, mode, amp_dtype=amp_dtype)
         
         torch.cuda.synchronize()
 
@@ -94,7 +103,7 @@ def benchmark_model(dataset, config: BenchmarkConfig,  mode, device, warmup_flag
         start = timeit.default_timer()
 
         with torch.cuda.nvtx.range("measurement_step"):
-            run_step(lm, optimizer, train_data, labels, mode)
+            run_step(lm, optimizer, train_data, labels, mode, amp_dtype=amp_dtype)
             torch.cuda.synchronize()
 
         times.append(timeit.default_timer() - start)
@@ -109,10 +118,10 @@ if __name__ == "__main__":
         d_ff=3072,
         num_layers=12,
         num_heads=12,
-        batch_size=1,
+        batch_size=8,
         context_length=256,
         warmup_iterations=5,
-        iterations=3,
+        iterations=100,
         vocab_size=10000,
         max_norm=1.0,
     )
@@ -131,7 +140,8 @@ if __name__ == "__main__":
         config,
         mode,
         device=device,
-        dtype=torch.float32,
+        param_dtype=torch.float32,
+        amp_dtype=torch.bfloat16
     )
     print(times)
     print(f"Mean: {statistics.mean(times) * 1000:.2f} ms")
