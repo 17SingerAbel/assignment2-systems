@@ -194,3 +194,9 @@ However, the observed improvement was dominated by the optimizer timing differen
 Since the optimizer operates on FP32 data in both configurations, this difference cannot yet be attributed directly to mixed precision.
 
 Further profiling is required before drawing conclusions about the performance benefits of BF16 AMP.
+
+
+
+for memory.
+
+full training, the peak of float32 are 4.5gb and valley is around 2gb, , bf16 are 2.5gb at peak, valley is lower than 0.5gb.

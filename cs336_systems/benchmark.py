@@ -74,7 +74,7 @@ def run_step(lm, optimizer, train_data, labels, mode, amp_dtype):
             optimizer.step()
 
 
-def benchmark_model(dataset, config: BenchmarkConfig,  mode, device, warmup_flag=True, param_dtype=torch.float32, amp_dtype=None):
+def benchmark_model(dataset, config: BenchmarkConfig,  mode, device, warmup_flag=True, param_dtype=torch.float32, amp_dtype=None, memory_profile=False):
     lm = BasicsTransformerLM(config.vocab_size, config.context_length, config.d_model, config.num_layers, config.num_heads, config.d_ff, rope_theta=None)
     param_bytes = sum(
         p.numel() * p.element_size()
@@ -95,6 +95,8 @@ def benchmark_model(dataset, config: BenchmarkConfig,  mode, device, warmup_flag
         
         torch.cuda.synchronize()
 
+    if memory_profile:
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
     # measurement
     times = []
 
@@ -107,6 +109,11 @@ def benchmark_model(dataset, config: BenchmarkConfig,  mode, device, warmup_flag
             torch.cuda.synchronize()
 
         times.append(timeit.default_timer() - start)
+
+    if memory_profile:
+        torch.cuda.memory._dump_snapshot(f"{mode}_{amp_dtype}_memory_snapshot.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
+
     return times
 
 
@@ -141,7 +148,8 @@ if __name__ == "__main__":
         mode,
         device=device,
         param_dtype=torch.float32,
-        amp_dtype=torch.bfloat16
+        amp_dtype=torch.float32,
+        memory_profile=True
     )
     print(times)
     print(f"Mean: {statistics.mean(times) * 1000:.2f} ms")
