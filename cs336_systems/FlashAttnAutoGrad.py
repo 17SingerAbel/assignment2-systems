@@ -72,14 +72,81 @@ class FlashAttnAutoGrad(torch.autograd.Function):
     def backward(ctx, grad_output):
         Q, K, V, O, L = ctx.saved_tensors
         scale = 1.0 / math.sqrt(Q.shape[-1])
-        scores = einsum(Q, K, '... n_query d_model, ... n_key d_model -> ... n_query n_key') * scale
-        P = torch.exp(scores - L.unsqueeze(-1))
+        # scores = einsum(Q, K, '... n_query d_model, ... n_key d_model -> ... n_query n_key') * scale
+        # P = torch.exp(scores - L.unsqueeze(-1))
 
-        dV = einsum(P, grad_output, '... n_query n_key, ... n_query d_model -> ... n_key d_model')
-        dP = einsum(grad_output, V, '... n_query d_model, ... n_key d_model -> ... n_query n_key')
+        # dV = einsum(P, grad_output, '... n_query n_key, ... n_query d_model -> ... n_key d_model')
+        # dP = einsum(grad_output, V, '... n_query d_model, ... n_key d_model -> ... n_query n_key')
 
-        D = torch.sum(O * grad_output, dim=-1, keepdim=True)
-        dS = P * (dP - D)
-        dQ = dS @ K * scale
-        dK = dS.transpose(-1, -2) @ Q * scale
+        # D = torch.sum(O * grad_output, dim=-1, keepdim=True)
+        # dS = P * (dP - D)
+        # dQ = dS @ K * scale
+        # dK = dS.transpose(-1, -2) @ Q * scale
+        # return (dQ, dK, dV, None)[:len(ctx.needs_input_grad)]
+
+        dQ, dK, dV = flash_backward(Q, K, V, O, grad_output, L, scale)
         return (dQ, dK, dV, None)[:len(ctx.needs_input_grad)]
+
+@torch.compile
+def flash_backward(Q, K, V, O, dO, L, scale):
+    # 在这里写 PyTorch 分块循环
+    # 计算 D、重算每块 P、累计 dQ/dK/dV
+    D = torch.sum(O * dO, dim=-1, keepdim=True)
+    B_q = 16
+    B_k = 16
+
+    num_q_tiles = math.ceil(Q.shape[-2] / B_q)
+    num_k_tiles = math.ceil(K.shape[-2] / B_k)
+
+    dK = torch.zeros_like(K)
+    dV = torch.zeros_like(V)
+    dQ = torch.zeros_like(Q)
+
+    for j in range(num_k_tiles):
+        k_start = j * B_k
+        k_tile = K[..., k_start:k_start+B_k, :]
+        v_tile = V[..., k_start:k_start+B_k, :]
+
+        dk_tile = torch.zeros_like(k_tile)
+        dv_tile = torch.zeros_like(k_tile)
+
+        for i in range(num_q_tiles):
+            q_start = i * B_q
+            q_tile = Q[..., q_start:q_start+B_q, :]
+            l_tile = L[..., q_start:q_start+B_q]
+            d_tile = D[..., q_start:q_start+B_q, :]
+            # o_tile = O[..., q_start:q_start+B_q, :]
+            do = dO[..., q_start:q_start+B_q, :]
+
+            s_tile = q_tile @ k_tile.transpose(-1, -2) * scale
+            p_tile = torch.exp(s_tile - l_tile.unsqueeze(-1))
+            
+            dv_tile = dv_tile + p_tile.transpose(-1, -2) @ do
+            dp = do @ v_tile.transpose(-1, -2)
+            ds = p_tile * (dp - d_tile)
+            dk_tile = dk_tile + ds.transpose(-1, -2) @ q_tile * scale
+
+            dK[..., k_start:k_start+B_k, :] = dk_tile
+            dV[..., k_start:k_start+B_k, :] = dv_tile
+
+    for i in range(num_q_tiles):
+        q_start = i * B_q
+        q_tile = Q[..., q_start:q_start+B_q, :]
+        do = dO[..., q_start:q_start+B_q, :]
+        l_tile = L[..., q_start:q_start+B_q]
+        d_tile = D[..., q_start:q_start+B_q, :]
+        dq_tile = torch.zeros_like(q_tile)
+
+        for j in range(num_k_tiles):
+            k_start = j * B_k
+            k_tile = K[..., k_start:k_start+B_k, :]
+            v_tile = V[..., k_start:k_start+B_k, :]
+            s_tile = q_tile @ k_tile.transpose(-1, -2) * scale
+            p_tile = torch.exp(s_tile - l_tile.unsqueeze(-1))
+            dp = do @ v_tile.transpose(-1, -2)
+            ds = p_tile * (dp - d_tile)
+            dq_tile = dq_tile + ds @ k_tile * scale
+
+            dQ[..., q_start:q_start+B_q, :] = dq_tile
+            
+    return dQ, dK, dV   
