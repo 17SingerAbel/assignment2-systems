@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from cs336_systems.FlashAttnAutoGrad import FlashAttnAutoGrad
+from cs336_systems.FlashAttnTriton import FlashAttnTriton
 
 def get_flashattention_autograd_function_pytorch() -> type:
     """
@@ -30,7 +31,7 @@ def get_flashattention_autograd_function_triton() -> type:
         A class object (not an instance of the class)
     """
     # For example: return MyTritonFlashAttentionAutogradFunctionClass
-    raise NotImplementedError
+    return FlashAttnTriton
 
 
 def get_ddp(module: torch.nn.Module) -> torch.nn.Module:

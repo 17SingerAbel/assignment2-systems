@@ -30,6 +30,8 @@ class FlashAttnAutoGrad(torch.autograd.Function):
             prev_max = Q.new_full((*q_tile.shape[:-1], 1), -math.inf)
             prev_O = Q.new_zeros((*q_tile.shape[:-1], d_head))
 
+            q_pos = q_start + torch.arange(q_tile.shape[-2], device=Q.device)
+
             for j in range(num_k_tiles):
                 k_start = j * B_k
                 k_tile = K[..., k_start: k_start+B_k, :]
@@ -37,7 +39,14 @@ class FlashAttnAutoGrad(torch.autograd.Function):
                 # print(q_tile.shape, k_tile.shape)
 
                 scores = einsum(q_tile, k_tile, "... query d_head, ... key d_head -> ... query key") / math.sqrt(d_head)
-    
+
+                if is_causal:
+                    k_pos = k_start + torch.arange(k_tile.shape[-2], device=K.device)
+                    future = k_pos[None, :] > q_pos[:, None]  # [当前 query 数, 当前 key 数]
+                    scores = scores.masked_fill(future, -math.inf)
+
+
+
                 curr_max = torch.maximum(prev_max, torch.amax(scores, dim=-1, keepdim=True)) 
                 P = torch.exp(scores - curr_max)
 
@@ -47,9 +56,9 @@ class FlashAttnAutoGrad(torch.autograd.Function):
                 prev_max = curr_max
                 prev_l = l
                 prev_O = O
-                print('max diff shape, ', torch.exp(prev_max - curr_max).shape)
-                print("l shape, ", prev_l.shape)
-                print("o shape, ", prev_O.shape)
+                # print('max diff shape, ', torch.exp(prev_max - curr_max).shape)
+                # print("l shape, ", prev_l.shape)
+                # print("o shape, ", prev_O.shape)
 
             final_O[..., q_start:q_start+B_q, :] = prev_O / l
             final_L[..., q_start:q_start+B_q] = (prev_max + torch.log(prev_l)).squeeze(-1)
@@ -61,4 +70,16 @@ class FlashAttnAutoGrad(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        raise NotImplementedError
+        Q, K, V, O, L = ctx.saved_tensors
+        scale = 1.0 / math.sqrt(Q.shape[-1])
+        scores = einsum(Q, K, '... n_query d_model, ... n_key d_model -> ... n_query n_key') * scale
+        P = torch.exp(scores - L.unsqueeze(-1))
+
+        dV = einsum(P, grad_output, '... n_query n_key, ... n_query d_model -> ... n_key d_model')
+        dP = einsum(grad_output, V, '... n_query d_model, ... n_key d_model -> ... n_query n_key')
+
+        D = torch.sum(O * grad_output, dim=-1, keepdim=True)
+        dS = P * (dP - D)
+        dQ = dS @ K * scale
+        dK = dS.transpose(-1, -2) @ Q * scale
+        return (dQ, dK, dV, None)[:len(ctx.needs_input_grad)]
