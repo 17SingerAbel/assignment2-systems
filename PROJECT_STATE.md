@@ -2,7 +2,7 @@
 Updated: 2026-11-24
 
 ## Resume card
-- Current task: Step-by-step walkthrough of Section 4 leftovers. Step 1 DONE (agent edited at user's request): `causal_mask_tile` + `is_causal` in PyTorch `flash_backward`; non-causal test passes; causal grads vs autograd reference max err ~1e-6 (N=64, CPU). Uncommitted. Next: optional tile-skip, then step 2.
+- Current task: Step-by-step walkthrough of Section 4 leftovers. Step 1 DONE, committed `d198752` (causal mask in PyTorch `flash_backward`). User then added causal tile-skip (continue/break) themselves; agent wired `FlashAttnTriton.backward` -> `flash_backward` (+ fixed `ctx.is_casual` typo). bf16 fixed: Triton fwd casts O on store; Triton bwd upcasts all to fp32 then casts grads back (simple, no bf16 speedup in bwd; proper mixed-precision bwd = possible later optimization). All 6 tests pass; causal fp32 grads err ~1e-6; bf16 causal O/grads err ~1e-2 vs fp32 ref (2026-11-24). Committed. Next: step 2 discussion (torch.compile unrolls the Python double loop).
 - User decision (2026-11-24): teaching first, one concept per turn. Agent edits in one turn were too many; user reverted them with `git checkout .`.
 - Branch `flash-attn`, HEAD `41a2edc`. Tracked files = user's code (causal backward absent; `FlashAttnTriton.backward` raises NotImplementedError; Triton fwd bf16 store lacks a cast to O dtype).
 - Untracked agent files still present (reference only, user decides keep/delete): `cs336_systems/flash_benchmark.py`, `cs336_systems/allreduce_benchmark.py`, `scripts/gcp/*`, `reports/flash_benchmark.{csv,md}`. The benchmark depended on the reverted edits and won't run as-is; its results came from reverted code.

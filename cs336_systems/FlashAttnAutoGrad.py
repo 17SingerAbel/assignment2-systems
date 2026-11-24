@@ -120,6 +120,8 @@ def flash_backward(Q, K, V, O, dO, L, scale, is_causal=False):
 
         for i in range(num_q_tiles):
             q_start = i * B_q
+            if is_causal and k_start > q_start + B_q -1:
+                continue
             q_tile = Q[..., q_start:q_start+B_q, :]
             l_tile = L[..., q_start:q_start+B_q]
             d_tile = D[..., q_start:q_start+B_q, :]
@@ -149,6 +151,8 @@ def flash_backward(Q, K, V, O, dO, L, scale, is_causal=False):
 
         for j in range(num_k_tiles):
             k_start = j * B_k
+            if is_causal and k_start > q_start + B_q - 1:
+                break
             k_tile = K[..., k_start:k_start+B_k, :]
             v_tile = V[..., k_start:k_start+B_k, :]
             s_tile = q_tile @ k_tile.transpose(-1, -2) * scale

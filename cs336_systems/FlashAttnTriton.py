@@ -2,6 +2,7 @@ import torch
 import math
 from einops import einsum, rearrange
 import triton
+from cs336_systems.FlashAttnAutoGrad import flash_backward
 
 import triton.language as tl
 
@@ -41,7 +42,7 @@ class FlashAttnTriton(torch.autograd.Function):
         )
 
         ctx.save_for_backward(Q, K, V, O, L)
-        ctx.is_casual = is_causal
+        ctx.is_causal = is_causal
         return O
         
     @triton.jit
@@ -147,11 +148,25 @@ class FlashAttnTriton(torch.autograd.Function):
             K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
             V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
 
-        tl.store(O_block_ptr, o_tile / l_tile[:, None], boundary_check=(0,))
+        # o_tile accumulates in fp32; O may be bf16 -> cast on store
+        tl.store(O_block_ptr, (o_tile / l_tile[:, None]).to(O_block_ptr.type.element_ty), boundary_check=(0,))
         tl.store(L_block_ptr, prev_m + tl.log(l_tile), boundary_check=(0,))
 
 
 
     @staticmethod
     def backward(ctx, grad_output):
-        raise NotImplementedError
+        # "Partially Triton": forward is the Triton kernel above, backward reuses
+        # the torch.compile'd PyTorch tiled backward. It only needs the saved
+        # Q, K, V, O, L, so it doesn't care which forward produced them.
+        Q, K, V, O, L = ctx.saved_tensors
+        scale = 1.0 / math.sqrt(Q.shape[-1])
+        # L is fp32 (softmax stats need it), but Q/K/V/O/dO may be bf16, and
+        # bf16 @ fp32 matmuls fail. Simple + correct: run the whole backward in
+        # fp32, cast grads back. Cost: bf16 gets no bf16 speedup in backward.
+        in_dtype = Q.dtype
+        dQ, dK, dV = flash_backward(
+            Q.float(), K.float(), V.float(), O.float(), grad_output.float(),
+            L, scale, ctx.is_causal,
+        )
+        return dQ.to(in_dtype), dK.to(in_dtype), dV.to(in_dtype), None
