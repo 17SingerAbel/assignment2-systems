@@ -95,7 +95,10 @@ def causal_mask_tile(s_tile, q_start, k_start):
     future = k_pos[None, :] > q_pos[:, None]  # [n_q, n_k], broadcasts over batch dims
     return s_tile.masked_fill(future, -math.inf)
 
-@torch.compile
+# No @torch.compile: dynamo would unroll this Python double loop into one graph
+# with ~(N/16)^2 iterations, so compile time explodes with N (measured
+# 24s/102s/446s at N=128/256/512). Eager keeps tile=16 comparable with Triton.
+# TODO(after A2): compile only the per-tile body + larger tiles; Triton backward.
 def flash_backward(Q, K, V, O, dO, L, scale, is_causal=False):
     # 在这里写 PyTorch 分块循环
     # 计算 D、重算每块 P、累计 dQ/dK/dV
