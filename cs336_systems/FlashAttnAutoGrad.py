@@ -84,11 +84,19 @@ class FlashAttnAutoGrad(torch.autograd.Function):
         # dK = dS.transpose(-1, -2) @ Q * scale
         # return (dQ, dK, dV, None)[:len(ctx.needs_input_grad)]
 
-        dQ, dK, dV = flash_backward(Q, K, V, O, grad_output, L, scale)
+        dQ, dK, dV = flash_backward(Q, K, V, O, grad_output, L, scale, ctx.is_causal)
         return (dQ, dK, dV, None)[:len(ctx.needs_input_grad)]
 
+def causal_mask_tile(s_tile, q_start, k_start):
+    """Backward recomputes P from Q, K, L, so the forward's mask is gone.
+    Re-apply it: future keys (k_pos > q_pos) get -inf, so exp() makes P exactly 0."""
+    q_pos = q_start + torch.arange(s_tile.shape[-2], device=s_tile.device)  # global query index per row
+    k_pos = k_start + torch.arange(s_tile.shape[-1], device=s_tile.device)  # global key index per column
+    future = k_pos[None, :] > q_pos[:, None]  # [n_q, n_k], broadcasts over batch dims
+    return s_tile.masked_fill(future, -math.inf)
+
 @torch.compile
-def flash_backward(Q, K, V, O, dO, L, scale):
+def flash_backward(Q, K, V, O, dO, L, scale, is_causal=False):
     # 在这里写 PyTorch 分块循环
     # 计算 D、重算每块 P、累计 dQ/dK/dV
     D = torch.sum(O * dO, dim=-1, keepdim=True)
@@ -119,8 +127,10 @@ def flash_backward(Q, K, V, O, dO, L, scale):
             do = dO[..., q_start:q_start+B_q, :]
 
             s_tile = q_tile @ k_tile.transpose(-1, -2) * scale
+            if is_causal:
+                s_tile = causal_mask_tile(s_tile, q_start, k_start)
             p_tile = torch.exp(s_tile - l_tile.unsqueeze(-1))
-            
+
             dv_tile = dv_tile + p_tile.transpose(-1, -2) @ do
             dp = do @ v_tile.transpose(-1, -2)
             ds = p_tile * (dp - d_tile)
@@ -142,6 +152,8 @@ def flash_backward(Q, K, V, O, dO, L, scale):
             k_tile = K[..., k_start:k_start+B_k, :]
             v_tile = V[..., k_start:k_start+B_k, :]
             s_tile = q_tile @ k_tile.transpose(-1, -2) * scale
+            if is_causal:
+                s_tile = causal_mask_tile(s_tile, q_start, k_start)
             p_tile = torch.exp(s_tile - l_tile.unsqueeze(-1))
             dp = do @ v_tile.transpose(-1, -2)
             ds = p_tile * (dp - d_tile)

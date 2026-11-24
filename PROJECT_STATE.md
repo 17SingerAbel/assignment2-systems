@@ -1,19 +1,16 @@
 # Project State
-Updated: 2026-11-20
+Updated: 2026-11-24
 
 ## Resume card
-- Current task: User is working on distributed_hello_world.py and wants a quick route to a GCP VM with two GPUs. PyTorch FlashAttention is complete per user; its benchmark remains deferred.
-- Branch: `flash-attn`; HEAD `c9b3851` (2026-11-18, tiled-backward checkpoint), verified on 2026-11-20.
-- Last discussion: Reviewed the CPU/Gloo demo and researched GCP single-VM, two-GPU provisioning; proposed N1 + 2 T4 GPUs using a current Deep Learning VM base image.
-- Completed artifacts: Benchmark harness, profiling draft/captures, PyTorch tiled forward/backward (completion confirmed by user), Triton tiled forward, and adapter wiring.
-- Verification boundary: Current source and Git history inspected on 2026-11-20; no tests, notebooks, GPU experiments, or profiler captures rerun. No fresh test-pass claim is made.
-- Source evidence: Both backward loops now use p_tile in the softmax-gradient expression; the dQ loop selects d_tile for its current query range. The two previously recorded blockers are superseded.
-- Remaining scope: Causal backward handling is absent in the inspected PyTorch helper. Triton backward was previously recorded as unimplemented; it was not re-inspected in this correction.
-- Confirmed conceptual decision: Preserve independent batch samples; do not flatten batch and sequence into one attention sequence.
-- Proposed next action: User checks GCP billing/quota and creates the proposed VM if desired, verifies two GPUs, then adapts the demo for GPU communication. No cloud creation command was executed by the agent.
-- Teaching boundary: Explain and review student work; do not implement core assignment solutions.
-- Execution context: `/home/abel/projects/assignment2-systems`; dependency workflow documented as `uv`; runtime/GPU availability not checked in this review.
-- Sync status: This correction is local; no commit, push, or cross-device synchronization performed in this turn.
+- Current task: Step-by-step walkthrough of Section 4 leftovers. Step 1 DONE (agent edited at user's request): `causal_mask_tile` + `is_causal` in PyTorch `flash_backward`; non-causal test passes; causal grads vs autograd reference max err ~1e-6 (N=64, CPU). Uncommitted. Next: optional tile-skip, then step 2.
+- User decision (2026-11-24): teaching first, one concept per turn. Agent edits in one turn were too many; user reverted them with `git checkout .`.
+- Branch `flash-attn`, HEAD `41a2edc`. Tracked files = user's code (causal backward absent; `FlashAttnTriton.backward` raises NotImplementedError; Triton fwd bf16 store lacks a cast to O dtype).
+- Untracked agent files still present (reference only, user decides keep/delete): `cs336_systems/flash_benchmark.py`, `cs336_systems/allreduce_benchmark.py`, `scripts/gcp/*`, `reports/flash_benchmark.{csv,md}`. The benchmark depended on the reverted edits and won't run as-is; its results came from reverted code.
+- Facts measured 2026-11-24 (RTX 3070) worth re-teaching: compiled 16x16 double-loop backward first-call 24s/102s/446s at N=128/256/512 (unrolling); TF32 makes fp32 Triton error ~2e-3; naive attention OOM at N>=32768.
+- Planned order: 1 causal bwd -> 2 compile-unrolling problem -> 3 benchmark design -> 4 reading results -> 5 all-reduce metrics -> 6 GCP scripts (after user installs gcloud).
+- Open: update CLAUDE.md "speed is the agent's job" line? (asked, no answer yet); xl vs smaller model for DDP; GCP standing permission.
+- Test command: `env -u PYTHONPATH PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest -q tests/test_attention.py` (ROS pollutes PYTHONPATH).
+- Sync status: local only; nothing committed or pushed by agent.
 
 ## Distributed hello world / GCP planning (2026-11-20)
 - User-selected task: distributed_hello_world.py; GPU provisioning guidance is separate from the deferred FlashAttention benchmark.
