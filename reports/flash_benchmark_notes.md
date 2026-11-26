@@ -116,5 +116,25 @@ Data: `reports/flash_fp32_coarse.csv` (before), `reports/flash_fp32_coarse_skip.
    512. Guess (unverified): naive's ~10 kernels each have a fixed GPU cost
    that dominates at tiny N; Triton is one kernel.
 
+## 2026-11-25 — Peak forward memory (fp32, d=64, causal)
+
+Extra memory allocated during one forward (autograd on), on top of the inputs:
+
+| N     | naive     | triton   |
+|------:|----------:|---------:|
+| 4096  | 280 MiB   | 1.0 MiB  |
+| 8192  | 1088 MiB  | 2.0 MiB  |
+| 16384 | 4352 MiB  | 4.1 MiB  |
+| 32768 | OOM       | 8.1 MiB  |
+| 65536 | OOM       | 16.2 MiB |
+
+- naive grows 4x per doubling of N (O(N^2)): it materializes N x N scores
+  and probabilities in HBM, and autograd keeps them for backward. 4352 MiB at
+  N=16384 ≈ 4.25 N x N fp32 tensors (one is 1 GiB).
+- triton grows 2x per doubling (O(N·d)): it only writes O (N x d) and L (N).
+  16.2 MiB at N=65536 = 65536·64·4 B (O, 16 MiB) + 65536·4 B (L, 0.25 MiB):
+  exactly the output, nothing N x N. Scores/probabilities live only in
+  on-chip SRAM/registers, one tile at a time; backward recomputes P from L.
+
 Not done: a stress test (sustained load, clocks/thermals over minutes) is a
 different experiment from this latency benchmark.
