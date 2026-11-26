@@ -136,5 +136,14 @@ Extra memory allocated during one forward (autograd on), on top of the inputs:
   exactly the output, nothing N x N. Scores/probabilities live only in
   on-chip SRAM/registers, one tile at a time; backward recomputes P from L.
 
+## 2026-11-25 — Head dimension and backward (wrap-up)
+
+- Speedup ∝ ~1/d: at N=16384, 8.98x (d=16), 3.82x (32), 2.28x (64), 1.23x (128).
+  naive fwd barely moves with d (36.2 -> 41.3 ms): memory-bound on N x N
+  tensors. triton ~2x per doubling of d (4.0 -> 33.7 ms): compute-bound.
+- Backward/e2e (d=64, N<=2048): triton e2e ≈ its eager backward (Amdahl);
+  no conclusion about recompute cost possible until a Triton backward exists.
+- Full write-up: reports/README.md, section "FlashAttention-2 Benchmark".
+
 Not done: a stress test (sustained load, clocks/thermals over minutes) is a
 different experiment from this latency benchmark.

@@ -1,0 +1,17 @@
+# gpu=NVIDIA GeForce RTX 3070 torch=2.11.0+cu130 triton=3.6.0 date=2026-11-25T22:11:02 batch=1 heads=1 causal=True tile=16 tl.dot=ieee timing=do_bench median (GPU time)
+seq_len,d_head,dtype,impl,fwd_ms,bwd_ms,e2e_ms,correct
+128,64,fp32,naive,0.0358,0.0676,0.3784,True
+128,64,fp32,tiled,23.8213,29.1420,54.3846,True
+128,64,fp32,triton,0.0195,29.1412,29.9264,True
+256,64,fp32,naive,0.0410,0.0788,0.3943,True
+256,64,fp32,tiled,96.0594,112.1935,208.3951,True
+256,64,fp32,triton,0.0328,105.7413,106.1212,True
+512,64,fp32,naive,0.0594,0.1207,0.3978,True
+512,64,fp32,tiled,360.2043,417.7101,781.0314,True
+512,64,fp32,triton,0.0614,423.7322,421.6218,True
+1024,64,fp32,naive,0.1741,0.4209,0.5919,True
+1024,64,fp32,tiled,1423.5720,1605.1097,3031.1853,True
+1024,64,fp32,triton,0.1444,1599.3080,1603.0873,True
+2048,64,fp32,naive,0.6411,1.4653,2.0931,unchecked
+2048,64,fp32,tiled,skipped,skipped,skipped,unchecked
+2048,64,fp32,triton,0.4280,6337.4185,6339.6978,unchecked

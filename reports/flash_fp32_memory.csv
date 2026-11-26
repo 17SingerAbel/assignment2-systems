@@ -1,0 +1,12 @@
+# Peak extra GPU memory during one forward (autograd on), on top of inputs. RTX 3070, fp32, d=64, causal, batch=1. Measured 2026-11-25 with torch.cuda.max_memory_allocated (see flash_benchmark_notes.md).
+seq_len,impl,peak_mib
+4096,naive,280.2
+8192,naive,1088.1
+16384,naive,4352.2
+32768,naive,OOM
+65536,naive,OOM
+4096,triton,1.0
+8192,triton,2.0
+16384,triton,4.1
+32768,triton,8.1
+65536,triton,16.2
