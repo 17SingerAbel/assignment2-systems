@@ -127,7 +127,10 @@ class FlashAttnTriton(torch.autograd.Function):
 
             key_indices = i * K_TILE_SIZE + key_cols
 
-            scores = tl.dot(q_tile, tl.trans(k_tile)) * scale
+            # input_precision="ieee": real fp32 matmul for fp32 inputs. The default
+            # ("tf32") rounds inputs to a 10-bit mantissa on tensor cores, which
+            # made "fp32" Triton ~1e-3 off and unfairly faster than fp32 PyTorch.
+            scores = tl.dot(q_tile, tl.trans(k_tile), input_precision="ieee") * scale
             valid = key_indices[None, :] < N_KEYS
             if IS_CAUSAL:
                 valid = valid & (key_indices[None, :] <= query_indices[:, None])
@@ -140,7 +143,7 @@ class FlashAttnTriton(torch.autograd.Function):
 
             alpha = tl.exp(prev_m - curr_m)
             l_tile = alpha * l_tile + tl.sum(p, axis=1)
-            o_tile = tl.dot(p.to(v_tile.dtype), v_tile,  alpha[:, None] * o_tile)
+            o_tile = tl.dot(p.to(v_tile.dtype), v_tile,  alpha[:, None] * o_tile, input_precision="ieee")
 
 
             prev_m = curr_m
@@ -157,16 +160,11 @@ class FlashAttnTriton(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         # "Partially Triton": forward is the Triton kernel above, backward reuses
-        # the torch.compile'd PyTorch tiled backward. It only needs the saved
-        # Q, K, V, O, L, so it doesn't care which forward produced them.
+        # the eager PyTorch tiled backward. It only needs the saved Q, K, V, O, L,
+        # so it doesn't care which forward produced them. flash_backward follows
+        # the shared precision policy (fp32 stats/accumulators, input-dtype matmul
+        # inputs), so no blanket fp32 upcast is needed here.
         Q, K, V, O, L = ctx.saved_tensors
         scale = 1.0 / math.sqrt(Q.shape[-1])
-        # L is fp32 (softmax stats need it), but Q/K/V/O/dO may be bf16, and
-        # bf16 @ fp32 matmuls fail. Simple + correct: run the whole backward in
-        # fp32, cast grads back. Cost: bf16 gets no bf16 speedup in backward.
-        in_dtype = Q.dtype
-        dQ, dK, dV = flash_backward(
-            Q.float(), K.float(), V.float(), O.float(), grad_output.float(),
-            L, scale, ctx.is_causal,
-        )
-        return dQ.to(in_dtype), dK.to(in_dtype), dV.to(in_dtype), None
+        dQ, dK, dV = flash_backward(Q, K, V, O, grad_output, L, scale, ctx.is_causal)
+        return dQ, dK, dV, None

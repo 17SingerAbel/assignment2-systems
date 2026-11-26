@@ -1,18 +1,16 @@
 # Project State
-Updated: 2026-11-24
+Updated: 2026-11-25
 
 ## Resume card
-- Current task: Step-by-step walkthrough of Section 4 leftovers. Step 1 DONE, committed `d198752` (causal mask in PyTorch `flash_backward`). User then added causal tile-skip (continue/break) themselves; agent wired `FlashAttnTriton.backward` -> `flash_backward` (+ fixed `ctx.is_casual` typo). bf16 fixed: Triton fwd casts O on store; Triton bwd upcasts all to fp32 then casts grads back (simple, no bf16 speedup in bwd; proper mixed-precision bwd = possible later optimization). All 6 tests pass; causal fp32 grads err ~1e-6; bf16 causal O/grads err ~1e-2 vs fp32 ref (2026-11-24). Committed `bb95256`. Then (user decision) removed @torch.compile from `flash_backward` (uncommitted); tests 6 passed in 1.45s.
-- Benchmark plan (user-approved direction): tile=16 for all; columns = naive attention (cs336-basics `scaled_dot_product_attention`, mask True=keep -> tril), PyTorch tiled eager, Triton fwd (+ same eager bwd). Single-shot timings (not do_bench, RTX 3070, causal d=64 fp32): tiled fwd 355/1418/5657/22868 ms at N=512/1k/2k/4k vs Triton 0.22/0.14/0.23/0.69 ms; eager tiled bwd 972/1669/6378 ms at 512/1k/2k. => tiled + bwd/e2e only feasible to N~2048.
-- TODO after A2: compiled per-tile backward with larger tiles; Triton backward; tile-size sweep; proper mixed-precision bwd.
-- User decision (2026-11-24): teaching first, one concept per turn. Agent edits in one turn were too many; user reverted them with `git checkout .`.
-- Branch `flash-attn`, HEAD `41a2edc`. Tracked files = user's code (causal backward absent; `FlashAttnTriton.backward` raises NotImplementedError; Triton fwd bf16 store lacks a cast to O dtype).
-- Untracked agent files still present (reference only, user decides keep/delete): `cs336_systems/flash_benchmark.py`, `cs336_systems/allreduce_benchmark.py`, `scripts/gcp/*`, `reports/flash_benchmark.{csv,md}`. The benchmark depended on the reverted edits and won't run as-is; its results came from reverted code.
-- Facts measured 2026-11-24 (RTX 3070) worth re-teaching: compiled 16x16 double-loop backward first-call 24s/102s/446s at N=128/256/512 (unrolling); TF32 makes fp32 Triton error ~2e-3; naive attention OOM at N>=32768.
-- Planned order: 1 causal bwd -> 2 compile-unrolling problem -> 3 benchmark design -> 4 reading results -> 5 all-reduce metrics -> 6 GCP scripts (after user installs gcloud).
-- Open: update CLAUDE.md "speed is the agent's job" line? (asked, no answer yet); xl vs smaller model for DDP; GCP standing permission.
-- Test command: `env -u PYTHONPATH PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest -q tests/test_attention.py` (ROS pollutes PYTHONPATH).
-- Sync status: local only; nothing committed or pushed by agent.
+- Current task: fp32 FlashAttention benchmark, built block by block in `cs336_systems/flash_benchmark.py`. Blocks 1-3 done (impls/inputs, correctness vs fp64 ref, do_bench timing w/ OOM/skipped). Next: block 4 = sweep loop + CSV/markdown; then block 5 = plot. bf16 parked by user ("don't over-dig").
+- User decisions: teaching first, one concept per turn; tile=16 everywhere; no torch.compile; Triton `tl.dot(input_precision="ieee")` (no TF32); one shared precision policy (fp32 S/softmax stats/accumulators, input-dtype matmul inputs) for naive/tiled/triton; backward measured only N<=2048; warmup stays do_bench default 25ms; 2-GPU work belongs to Section 5, not this benchmark.
+- Branch `flash-attn`; commits today: `d198752` causal bwd, `bb95256` Triton bwd wiring + tile skip, `7f5c468` remove compile, then precision/benchmark commit (see git log). Not pushed.
+- Verified (RTX 3070, 2026-11-24): 6/6 attention tests pass; fp32 err ~1e-6 all impls; N=1024 d=64 fp32 do_bench fwd naive 0.176 / tiled 1469 / triton 0.214 ms (naive beat triton — see reports/flash_benchmark_notes.md); do_bench = GPU time (L2 flush hides CPU launch overhead).
+- Stale, uncommitted: `reports/flash_benchmark.{csv,md}` are from the reverted 2026-11-24 code (TF32, auto tiles) — will be overwritten by block 4; don't cite them.
+- Untracked, not yet reviewed with user: `cs336_systems/allreduce_benchmark.py`, `scripts/gcp/*` (GCP tooling never run; gcloud not installed).
+- TODO after A2: compiled per-tile backward w/ larger tiles; Triton backward; tile-size sweep; TF32 as separate setting; realistic batch x heads=48 run; bf16 sweep.
+- Open: CLAUDE.md "speed is the agent's job" line (asked, unanswered); xl vs smaller model for DDP; GCP standing permission.
+- Run: `env -u PYTHONPATH -u VIRTUAL_ENV uv run python -m cs336_systems.flash_benchmark`; tests: add `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 uv run pytest -q tests/test_attention.py` (ROS pollutes PYTHONPATH).
 
 ## Distributed hello world / GCP planning (2026-11-20)
 - User-selected task: distributed_hello_world.py; GPU provisioning guidance is separate from the deferred FlashAttention benchmark.

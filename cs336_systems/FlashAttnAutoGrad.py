@@ -17,18 +17,19 @@ class FlashAttnAutoGrad(torch.autograd.Function):
         num_k_tiles = math.ceil(K.shape[-2] / B_k)
         d_head = Q.shape[-1] 
 
-        final_O = torch.zeros_like(Q)
-        final_L = Q.new_zeros(Q.shape[:-1])
-        print('num_q_tiles, ', num_q_tiles)
+        # Precision policy (same for naive / tiled / triton):
+        #   matmul inputs in the input dtype; scores, softmax stats (m, l, L),
+        #   exp and accumulators in fp32; P cast back to input dtype for P @ V.
+        final_O = torch.zeros_like(Q)                                # cast on write
+        final_L = Q.new_zeros(Q.shape[:-1], dtype=torch.float32)    # softmax stat -> fp32
         for i in range(num_q_tiles):
             q_start = i * B_q
             q_tile = Q[..., q_start:q_start+B_q, :]
             # initialize O_i(0)
-            # padding 
-            print("q_tile shape,", q_tile.shape)
-            prev_l = Q.new_zeros((*q_tile.shape[:-1], 1))
-            prev_max = Q.new_full((*q_tile.shape[:-1], 1), -math.inf)
-            prev_O = Q.new_zeros((*q_tile.shape[:-1], d_head))
+            # padding
+            prev_l = Q.new_zeros((*q_tile.shape[:-1], 1), dtype=torch.float32)
+            prev_max = Q.new_full((*q_tile.shape[:-1], 1), -math.inf, dtype=torch.float32)
+            prev_O = Q.new_zeros((*q_tile.shape[:-1], d_head), dtype=torch.float32)  # accumulator
 
             q_pos = q_start + torch.arange(q_tile.shape[-2], device=Q.device)
 
@@ -38,7 +39,7 @@ class FlashAttnAutoGrad(torch.autograd.Function):
                 v_tile = V[..., k_start: k_start+B_k, :]
                 # print(q_tile.shape, k_tile.shape)
 
-                scores = einsum(q_tile, k_tile, "... query d_head, ... key d_head -> ... query key") / math.sqrt(d_head)
+                scores = einsum(q_tile, k_tile, "... query d_head, ... key d_head -> ... query key").float() / math.sqrt(d_head)
 
                 if is_causal:
                     k_pos = k_start + torch.arange(k_tile.shape[-2], device=K.device)
@@ -51,7 +52,7 @@ class FlashAttnAutoGrad(torch.autograd.Function):
                 P = torch.exp(scores - curr_max)
 
                 l = torch.exp(prev_max - curr_max) * prev_l + torch.sum(P, dim=-1, keepdim=True)
-                O = torch.exp(prev_max - curr_max) * prev_O + P @ v_tile
+                O = torch.exp(prev_max - curr_max) * prev_O + P.to(v_tile.dtype) @ v_tile  # like Triton's p.to(v.dtype)
 
                 prev_max = curr_max
                 prev_l = l
@@ -102,7 +103,9 @@ def causal_mask_tile(s_tile, q_start, k_start):
 def flash_backward(Q, K, V, O, dO, L, scale, is_causal=False):
     # 在这里写 PyTorch 分块循环
     # 计算 D、重算每块 P、累计 dQ/dK/dV
-    D = torch.sum(O * dO, dim=-1, keepdim=True)
+    # Same precision policy as forward: S, P, dP, dS, D in fp32; cast P / dS to
+    # the input dtype only as matmul inputs. For fp32 inputs all casts are no-ops.
+    D = torch.sum(O.float() * dO.float(), dim=-1, keepdim=True)
     B_q = 16
     B_k = 16
 
@@ -118,8 +121,13 @@ def flash_backward(Q, K, V, O, dO, L, scale, is_causal=False):
         k_tile = K[..., k_start:k_start+B_k, :]
         v_tile = V[..., k_start:k_start+B_k, :]
 
-        dk_tile = torch.zeros_like(k_tile)
-        dv_tile = torch.zeros_like(k_tile)
+        # Accumulators in fp32 (mixed precision): with bf16 inputs, summing
+        # N/16 tile contributions in bf16 (~3 significant digits) loses more
+        # precision the longer the sequence (measured: err 4.7e-2 -> 9.5e-2 from
+        # N=128 to 2048). bf16 matmul results are promoted to fp32 on `+`;
+        # writing into dK/dV casts back to the input dtype.
+        dk_tile = torch.zeros_like(k_tile, dtype=torch.float32)
+        dv_tile = torch.zeros_like(k_tile, dtype=torch.float32)
 
         for i in range(num_q_tiles):
             q_start = i * B_q
@@ -131,15 +139,15 @@ def flash_backward(Q, K, V, O, dO, L, scale, is_causal=False):
             # o_tile = O[..., q_start:q_start+B_q, :]
             do = dO[..., q_start:q_start+B_q, :]
 
-            s_tile = q_tile @ k_tile.transpose(-1, -2) * scale
+            s_tile = (q_tile @ k_tile.transpose(-1, -2)).float() * scale
             if is_causal:
                 s_tile = causal_mask_tile(s_tile, q_start, k_start)
-            p_tile = torch.exp(s_tile - l_tile.unsqueeze(-1))
+            p_tile = torch.exp(s_tile - l_tile.unsqueeze(-1))       # fp32 (L is fp32)
 
-            dv_tile = dv_tile + p_tile.transpose(-1, -2) @ do
-            dp = do @ v_tile.transpose(-1, -2)
-            ds = p_tile * (dp - d_tile)
-            dk_tile = dk_tile + ds.transpose(-1, -2) @ q_tile * scale
+            dv_tile = dv_tile + p_tile.to(do.dtype).transpose(-1, -2) @ do
+            dp = (do @ v_tile.transpose(-1, -2)).float()
+            ds = p_tile * (dp - d_tile)                             # fp32
+            dk_tile = dk_tile + ds.to(q_tile.dtype).transpose(-1, -2) @ q_tile * scale
 
             dK[..., k_start:k_start+B_k, :] = dk_tile
             dV[..., k_start:k_start+B_k, :] = dv_tile
@@ -150,7 +158,7 @@ def flash_backward(Q, K, V, O, dO, L, scale, is_causal=False):
         do = dO[..., q_start:q_start+B_q, :]
         l_tile = L[..., q_start:q_start+B_q]
         d_tile = D[..., q_start:q_start+B_q, :]
-        dq_tile = torch.zeros_like(q_tile)
+        dq_tile = torch.zeros_like(q_tile, dtype=torch.float32)  # fp32 accumulator, same reason as dK/dV
 
         for j in range(num_k_tiles):
             k_start = j * B_k
@@ -158,13 +166,13 @@ def flash_backward(Q, K, V, O, dO, L, scale, is_causal=False):
                 break
             k_tile = K[..., k_start:k_start+B_k, :]
             v_tile = V[..., k_start:k_start+B_k, :]
-            s_tile = q_tile @ k_tile.transpose(-1, -2) * scale
+            s_tile = (q_tile @ k_tile.transpose(-1, -2)).float() * scale
             if is_causal:
                 s_tile = causal_mask_tile(s_tile, q_start, k_start)
             p_tile = torch.exp(s_tile - l_tile.unsqueeze(-1))
-            dp = do @ v_tile.transpose(-1, -2)
+            dp = (do @ v_tile.transpose(-1, -2)).float()
             ds = p_tile * (dp - d_tile)
-            dq_tile = dq_tile + ds @ k_tile * scale
+            dq_tile = dq_tile + ds.to(k_tile.dtype) @ k_tile * scale
 
             dQ[..., q_start:q_start+B_q, :] = dq_tile
             
