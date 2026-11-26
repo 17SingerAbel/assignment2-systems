@@ -121,7 +121,15 @@ class FlashAttnTriton(torch.autograd.Function):
         query_indices = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
         
         key_cols = tl.arange(0, K_TILE_SIZE)
-        for i in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+        n_k_tiles = tl.cdiv(N_KEYS, K_TILE_SIZE)
+        if IS_CAUSAL:
+            # Causal tile skip: the last query of this tile is
+            # (query_tile_index + 1) * Q_TILE_SIZE - 1, so key tiles starting
+            # after it are entirely in the future (P = 0). Stop the loop there
+            # instead of loading + computing + masking them (~half the work).
+            # The diagonal tile still runs and is masked below.
+            n_k_tiles = tl.minimum(n_k_tiles, tl.cdiv((query_tile_index + 1) * Q_TILE_SIZE, K_TILE_SIZE))
+        for i in range(n_k_tiles):
             k_tile = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
             v_tile = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
 

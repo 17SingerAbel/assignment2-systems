@@ -61,5 +61,60 @@ Findings:
   right metric to compare kernels, but at small N the wall time of a lone call
   can be higher. Report numbers as GPU time.
 
+## 2026-11-25 — Crossover study: prediction
+
+Question: from what sequence length does Triton beat naive, and how fast
+does its advantage grow? Metric: speedup = naive_fwd / triton_fwd (> 1 means
+Triton wins); crossover = N where speedup crosses 1.
+
+Plan: coarse sweep (powers of 2, fwd only) -> refine between the two N that
+bracket the crossover -> repeat coarse sweep for other d_head.
+
+**User's prediction:** crossover at N ≈ 2048; N=65536 not reachable (memory).
+Note: naive needs N x N scores (16 GB fp32 at N=65536 > 8 GB), Triton only
+O(N·d) memory, so expected: naive OOMs, Triton still runs (slowly, N^2 compute).
+
+## 2026-11-25 — Crossover study: results (fp32, d=64, fwd)
+
+Data: `reports/flash_fp32_coarse.csv` (before), `reports/flash_fp32_coarse_skip.csv` (after causal tile skip).
+
+| N     | naive  | triton (no skip) | triton (skip) | skip gain | speedup no-skip -> skip |
+|------:|-------:|-----------------:|--------------:|----------:|------------------------:|
+| 128   | 0.037  | 0.019            | 0.019         | 1.0x      | 1.93 -> 1.98 |
+| 256   | 0.041  | 0.033            | 0.033         | 1.0x      | 1.25 -> 1.25 |
+| 512   | 0.058  | 0.063            | 0.061         | 1.0x      | 0.93 -> 0.95 |
+| 1024  | 0.175  | 0.214            | 0.144         | 1.48x     | 0.82 -> 1.21 |
+| 2048  | 0.641  | 0.580            | 0.408         | 1.42x     | 1.11 -> 1.57 |
+| 4096  | 2.41   | 2.21             | 1.38          | 1.60x     | 1.09 -> 1.74 |
+| 8192  | 9.41   | 8.71             | 4.54          | 1.92x     | 1.08 -> 2.07 |
+| 16384 | 38.5   | 33.3             | 16.8          | 1.97x     | 1.16 -> 2.28 |
+| 32768 | OOM    | 130.0            | 65.8          | 1.98x     | – |
+| 65536 | OOM    | 519.3            | 261.8         | 1.98x     | – |
+
+(ms, do_bench median GPU time. Correctness checked for N <= 1024; tests pass.)
+
+1. **Without the skip, the advantage did not grow** (speedup flat ~1.1 for
+   N >= 2048). The Triton forward was causal-correct but looped over all key
+   tiles, computing then masking the future half. Both impls did ~full N^2
+   work at ~2 TFLOP/s (Triton N=65536: 1.1 TFLOP / 0.519 s; naive N=16384:
+   ~1.8 TFLOP/s; 3070 fp32 peak ~20 TFLOP/s per spec), so the ratio stayed constant.
+2. **With the skip, the advantage grows with N** (1.21 at 1024 -> 2.28 at
+   16384). Dense naive attention can't skip: it must compute the full N x N
+   matmul and mask afterwards. Skipping future tiles is FlashAttention's
+   natural ~2x for causal.
+3. **Crossover moved** from 1024-2048 (user's prediction 2048 matched the
+   no-skip version) to 512-1024.
+4. **Memory:** naive OOMs from N=32768; Triton runs to 65536 (O(N·d) memory).
+5. **Open question (hypothesis, unverified): why the skip only gives ~1.0-1.5x
+   for N <= 2048 but ~2x for N >= 8192.** With the skip, program i does i+1
+   key tiles, so work is unbalanced; at small N there are too few programs
+   (N=1024: 64 programs, 46 SMs) and wall time is set by the longest program
+   (last query tile, still a full row). At large N, thousands of programs in
+   many waves balance out. Test: raise batch (more programs) and see if the
+   small-N skip gain approaches 2x.
+6. Small-N oddity: Triton beats naive at N=128/256 (1.98x, 1.25x), loses at
+   512. Guess (unverified): naive's ~10 kernels each have a fixed GPU cost
+   that dominates at tiny N; Triton is one kernel.
+
 Not done: a stress test (sustained load, clocks/thermals over minutes) is a
 different experiment from this latency benchmark.

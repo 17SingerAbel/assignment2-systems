@@ -8,10 +8,15 @@ Three implementations, all causal, batch size 1, tile size 16:
 Built step by step; this is block 1 (implementations + inputs).
 """
 
+import argparse
+import csv
+import datetime
 import math
+import os
 import warnings
 
 import torch
+import triton
 from triton.testing import do_bench
 
 from cs336_basics.model import scaled_dot_product_attention
@@ -32,7 +37,9 @@ DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
 # Eager tiled attention launches ~10 kernels per 16x16 tile, (N/16)^2 tiles:
 # measured single forward 5.7s at N=2048, 22.9s at N=4096 (RTX 3070). Beyond
 # these limits a single config would take minutes, so we record "skipped".
-TILED_FWD_MAX_N = 2048
+# Crossover study only needs tiled as a "no fusion" reference line, so stop at
+# 1024 (1.5s per forward) to keep the sweep to minutes.
+TILED_FWD_MAX_N = 1024
 BWD_MAX_N = 2048   # tiled and triton share the same eager tiled backward
 
 
@@ -44,12 +51,19 @@ def build_impls(n, device="cuda"):
     mask itself is N x N bools (4GB at N=65536), part of why naive runs out of
     memory.
     """
+    mask_cache = {}
+
     def naive(q, k, v):
         # Same structure as cs336-basics scaled_dot_product_attention (full N x N
         # scores), but follows the shared precision policy: its softmax would
         # run in bf16 for bf16 inputs, ours runs in fp32 like tiled/triton.
+        # Mask built on first call (the untimed warmup), so if it alone doesn't
+        # fit (4GB at N=65536) that OOM is caught by measure() like any other.
+        if "keep" not in mask_cache:
+            # cs336-basics convention: True = keep. Causal keeps keys <= query -> lower triangle.
+            mask_cache["keep"] = torch.ones(n, n, device=device, dtype=torch.bool).tril()
         s = (q @ k.transpose(-1, -2)).float() / math.sqrt(q.shape[-1])
-        s = torch.where(causal_keep, s, float("-inf"))
+        s = torch.where(mask_cache["keep"], s, float("-inf"))
         p = softmax(s, dim=-1)                     # fp32
         return p.to(v.dtype) @ v
 
@@ -59,8 +73,6 @@ def build_impls(n, device="cuda"):
     def triton(q, k, v):
         return FlashAttnTriton.apply(q, k, v, True)
 
-    # cs336-basics convention: True = keep. Causal keeps keys <= query -> lower triangle.
-    causal_keep = torch.ones(n, n, device=device, dtype=torch.bool).tril()
     return {"naive": naive, "tiled": tiled, "triton": triton}
 
 
@@ -148,17 +160,22 @@ def bench_ms(fn, grad_to_none=None):
     return do_bench(fn, warmup=25, rep=100, grad_to_none=grad_to_none, return_mode="median")
 
 
-def measure(name, fn, q, k, v, do):
+def measure(name, fn, q, k, v, do, with_bwd=True):
     """{'fwd','bwd','e2e'} -> ms (float), 'OOM', or 'skipped'."""
     n = q.shape[-2]
     res = {"fwd": "skipped", "bwd": "skipped", "e2e": "skipped"}
     if name == "tiled" and n > TILED_FWD_MAX_N:
         return res
-    do_bwd = name == "naive" or n <= BWD_MAX_N
+    do_bwd = with_bwd and (name == "naive" or n <= BWD_MAX_N)
     grads = [q, k, v]  # reset .grad every rep: otherwise grads accumulate (extra work)
 
     try:
-        fn(q, k, v).backward(do)  # one untimed call: Triton JIT compile happens here
+        # One untimed call (Triton JIT compile happens here). Backward only if we
+        # time it: eager tiled bwd at large N would take hours for nothing.
+        o = fn(q, k, v)
+        if do_bwd:
+            o.backward(do)
+        del o
         # Forward with autograd on (training setting): naive keeps its N x N P for
         # backward, so this is also where its O(N^2) memory shows up.
         res["fwd"] = bench_ms(lambda: fn(q, k, v))
@@ -182,12 +199,60 @@ def measure(name, fn, q, k, v, do):
     return res
 
 
+# --- Block 4: sweep -----------------------------------------------------------
+
+# Correctness gate, not a precision study: confirm each impl computes attention
+# before we trust its timing (a wrong kernel is often a fast one). Forward
+# only, small N only, pass/fail.
+CHECK_MAX_N = 1024
+FIELDS = ["seq_len", "d_head", "dtype", "impl", "fwd_ms", "bwd_ms", "e2e_ms", "correct"]
+
+
+def check_correct(n, d, dtype_name, impls):
+    """{impl: True/False} vs float64 reference, or 'unchecked' for large N."""
+    if n > CHECK_MAX_N:
+        return {name: "unchecked" for name in impls}
+    q, k, v, do = make_inputs(n, d, DTYPES[dtype_name])
+    feasible = {name: fn for name, fn in impls.items() if not (name == "tiled" and n > TILED_FWD_MAX_N)}
+    errs = max_errors(q, k, v, do, feasible, with_grad=False)
+    return {name: (errs[name]["O"] <= TOLERANCE[dtype_name]) if name in errs else "unchecked"
+            for name in impls}
+
+
+def run_sweep(seq_lens, d_heads, dtype_name, with_bwd, out_csv):
+    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    with open(out_csv, "w", newline="") as f:
+        # Metadata first: numbers without their conditions can't be interpreted later.
+        f.write(f"# gpu={torch.cuda.get_device_name()} torch={torch.__version__} triton={triton.__version__} "
+                f"date={datetime.datetime.now().isoformat(timespec='seconds')} "
+                f"batch=1 heads=1 causal=True tile=16 tl.dot=ieee timing=do_bench median (GPU time)\n")
+        w = csv.DictWriter(f, fieldnames=FIELDS)
+        w.writeheader()
+        for d in d_heads:            # outer: one d = one complete set of lines
+            for n in seq_lens:       # inner: points along each line
+                impls = build_impls(n)
+                correct = check_correct(n, d, dtype_name, impls)
+                q, k, v, do = make_inputs(n, d, DTYPES[dtype_name])
+                for name, fn in impls.items():
+                    r = measure(name, fn, q, k, v, do, with_bwd=with_bwd)
+                    row = {"seq_len": n, "d_head": d, "dtype": dtype_name, "impl": name,
+                           **{f"{key}_ms": (f"{val:.4f}" if isinstance(val, float) else val)
+                              for key, val in r.items()},
+                           "correct": correct[name]}
+                    w.writerow(row)
+                    f.flush()  # a crash / Ctrl-C keeps every finished row
+                    print(" ".join(f"{key}={val}" for key, val in row.items()), flush=True)
+                del q, k, v, do, impls
+                torch.cuda.empty_cache()
+    print(f"wrote {out_csv}")
+
+
 if __name__ == "__main__":
-    # Block-3 smoke test: one config, fp32 only.
-    n, d = 1024, 64
-    q, k, v, do = make_inputs(n, d, torch.float32)
-    for name, fn in build_impls(n).items():
-        r = measure(name, fn, q, k, v, do)
-        print(f"fp32 N={n} d={d} {name:6s} "
-              + "  ".join(f"{key}={val:.3f}ms" if isinstance(val, float) else f"{key}={val}"
-                          for key, val in r.items()), flush=True)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--seqs", type=int, nargs="+", default=SEQ_LENS)
+    ap.add_argument("--dims", type=int, nargs="+", default=[64])
+    ap.add_argument("--dtype", choices=list(DTYPES), default="fp32")
+    ap.add_argument("--bwd", action="store_true", help="also time bwd/e2e (only up to BWD_MAX_N)")
+    ap.add_argument("--out", default="reports/flash_fp32_coarse.csv")
+    args = ap.parse_args()
+    run_sweep(args.seqs, args.dims, args.dtype, args.bwd, args.out)
